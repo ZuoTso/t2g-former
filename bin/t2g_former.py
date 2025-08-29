@@ -12,6 +12,44 @@ from torch import Tensor
 
 import lib
 
+# --- add at top of file ---
+import os
+from collections import defaultdict
+import numpy as np
+
+T2G_EXPORT_DIR = os.getenv("T2G_EXPORT_DIR", None)
+T2G_EXPORT_HEAD_REDUCE = os.getenv("T2G_EXPORT_HEAD_REDUCE", "mean")  # mean/sum/max
+_T2G_ACCUM = defaultdict(lambda: None)
+
+def _t2g_export_accum(name, A):
+    if T2G_EXPORT_DIR is None:
+        return
+    # A: (B,H,d,d) or (B,d,d) or (d,d)
+    if A.ndim == 4:  # head-reduce
+        if T2G_EXPORT_HEAD_REDUCE == "sum":
+            A = A.sum(1)
+        elif T2G_EXPORT_HEAD_REDUCE == "max":
+            A = A.max(1).values
+        else:
+            A = A.mean(1)
+    if A.ndim == 3:               # batch-reduce
+        A = A.sum(0)
+    # 只匯出方陣（避免最後一層只剩 [CLS] → 1×d 破壞對稱化）
+    if A.ndim == 2 and A.shape[-2] != A.shape[-1]:
+        return
+    A = A.detach().abs().to("cpu").numpy()
+    cur = _T2G_ACCUM[name]
+    _T2G_ACCUM[name] = A if cur is None else (cur + A)
+
+def flush_t2g_exports():
+    if T2G_EXPORT_DIR is None:
+        return
+    os.makedirs(T2G_EXPORT_DIR, exist_ok=True)
+    for i, (k, W) in enumerate(sorted(_T2G_ACCUM.items())):
+        W = 0.5 * (W + W.T)  # symmetrize
+        tag = (k if k else f"layer{i:02d}")
+        np.save(os.path.join(T2G_EXPORT_DIR, f"W_{tag}.npy"), W.astype("float32"))
+#
 
 # %%
 class Tokenizer(nn.Module):
@@ -247,6 +285,9 @@ class MultiheadGEAttention(nn.Module):
         )
         if self.W_out is not None:
             x = self.W_out(x)
+        # side-channel export（設了 T2G_EXPORT_DIR 才會生效）
+        _t2g_export_accum(getattr(self, "export_tag", None), fr_graph)
+        #
         return x, fr_graph.detach()
 
 
@@ -325,6 +366,9 @@ class T2GFormer(nn.Module):
                     'norm1': make_normalization(),
                 }
             )
+            # 命名每一層，輸出時好對應
+            layer['attention'].export_tag = f"layer{layer_idx:02d}"
+            #
             if not prenormalization or layer_idx:
                 layer['norm0'] = make_normalization()
             if kv_compression and self.shared_kv_compression is None:
